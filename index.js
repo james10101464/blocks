@@ -1,147 +1,180 @@
 // Universal proxy with:
 // - HTTP + WebSocket support
-// - Redirect rewriting so you don't "escape" the proxy
-// - Pass-through Set-Cookie (sessions work)
-// - Simple front-end (public/) that remembers targets via cookies
+// - Redirect rewriting -> keep user on proxy domain
+// - Cookie Domain rewriting -> sessions bind to proxy domain
+// - Strips CSP headers -> fewer client-side blocks
+// - Minimal frontend (public/) with cookie-saved recents
 
 const express = require("express");
 const cookieParser = require("cookie-parser");
+const morgan = require("morgan");
 const http = require("http");
 const { createProxyServer } = require("http-proxy");
 const { URL } = require("url");
 
 const app = express();
 app.use(cookieParser());
-app.use(express.static("public")); // serves index.html UI
+app.use(morgan("tiny"));
+app.use(express.static("public")); // serves index.html + assets
 
-// Keep it simple & robust
+// ---- Config (optional allowlist) ----
+const ALLOWLIST = null; // e.g., ["discord.com", "web.whatsapp.com"]
+
+function allowedHost(hostname) {
+  if (!ALLOWLIST) return true;
+  return ALLOWLIST.some(h => h === hostname || hostname.endsWith(`.${h}`));
+}
+
+// Create a single proxy instance
 const proxy = createProxyServer({
   changeOrigin: true,
   ws: true,
-  secure: true, // verify upstream TLS
+  secure: true,
   preserveHeaderKeyCase: true
 });
 
-// Helpful logs
+// Errors -> 502
 proxy.on("error", (err, req, res) => {
   console.error("Proxy error:", err?.message || err);
-  if (!res.headersSent) {
-    res.writeHead(502, { "Content-Type": "text/plain" });
-  }
-  res.end("Proxy error");
+  try {
+    if (!res.headersSent) {
+      res.writeHead(502, { "Content-Type": "text/plain" });
+    }
+    res.end("Proxy error");
+  } catch {}
 });
 
-// Pass through Set-Cookie, and rewrite redirects so they stay inside the proxy
+// Pass-through + rewrite on responses
 proxy.on("proxyRes", (proxyRes, req, res) => {
-  // Pass Set-Cookie back to the browser (critical for auth flows)
-  const setCookie = proxyRes.headers["set-cookie"];
-  if (setCookie) {
-    // Don’t munge cookies; just forward them as-is
-    res.setHeader("set-cookie", setCookie);
+  // Strip CSP & frame protections that can break proxied apps
+  delete proxyRes.headers["content-security-policy"];
+  delete proxyRes.headers["content-security-policy-report-only"];
+  delete proxyRes.headers["x-frame-options"];
+
+  // Keep redirects on our domain
+  const loc = proxyRes.headers["location"];
+  if (loc) {
+    try {
+      const absolute = new URL(loc, req._targetOrigin || undefined);
+      const selfOrigin = `${req._proto || "https"}://${req.headers.host}`;
+      proxyRes.headers["location"] =
+        `/proxy?url=${encodeURIComponent(absolute.toString())}`;
+    } catch {
+      // leave relative redirects as-is; browser will hit our /proxy path
+    }
   }
 
-  // Redirect rewriting: if upstream sends Location: https://origin/...
-  // rewrite it to our proxy so the browser stays on this domain.
-  const location = proxyRes.headers["location"];
-  if (location) {
-    try {
-      const locUrl = new URL(location);
-      // Build a proxied link that targets the FULL location URL
-      // Using full URL in query keeps it simple and robust.
-      const selfOrigin = `${req.protocol || "https"}://${req.headers.host}`;
-      const rewritten = `${selfOrigin}/proxy?target=${encodeURIComponent(locUrl.toString())}`;
-      proxyRes.headers["location"] = rewritten;
-    } catch {
-      // If not a valid absolute URL, leave it alone (relative redirects will follow through our proxy anyway)
+  // Cookie domain rewriting so sessions stick to our domain
+  const setCookies = proxyRes.headers["set-cookie"];
+  if (setCookies) {
+    const host = req.headers.host;
+    proxyRes.headers["set-cookie"] = setCookies.map((c) => {
+      // Force cookies to bind to our host
+      c = c.replace(/;\s*Domain=[^;]*/i, `; Domain=${host}`);
+      // SameSite=None helps cross-origin-ish flows; keep Secure for HTTPS
+      if (!/;\s*SameSite=/i.test(c)) c += "; SameSite=None";
+      if (!/;\s*Secure/i.test(c)) c += "; Secure";
+      return c;
+    });
+  }
+});
+
+// Ensure upstream sees "normal" browser-ish headers
+proxy.on("proxyReq", (proxyReq, req) => {
+  const upstreamOrigin = req._targetOrigin;
+  if (upstreamOrigin) {
+    proxyReq.setHeader("origin", upstreamOrigin);
+    proxyReq.setHeader("referer", upstreamOrigin + "/");
+    // you can also set a UA if needed:
+    if (!req.headers["user-agent"]) {
+      proxyReq.setHeader(
+        "user-agent",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome Safari"
+      );
     }
   }
 });
 
-// Small helper: extract target URL from query (?target=...)
-function getTargetUrl(reqUrl) {
-  const u = new URL(reqUrl, "http://placeholder"); // base won't be used for absolute URLs
-  const t = u.searchParams.get("target");
-  return t || null;
+// Helper: parse ?url
+function parseTargetFromReq(fullUrl, base = "http://placeholder") {
+  const u = new URL(fullUrl, base);
+  const raw = u.searchParams.get("url");
+  if (!raw) return null;
+  try {
+    return new URL(raw);
+  } catch {
+    return null;
+  }
 }
 
-// Route: /proxy?target=<FULL_URL>
-// We allow FULL URLs here (https://example.com/path?x=y)
+// ---- HTTP Proxy endpoint ----
+// Usage: /proxy?url=<FULL_URL>
 app.use("/proxy", (req, res) => {
-  const targetStr = getTargetUrl(req.url);
-  if (!targetStr) {
-    res.status(400).send("Missing ?target=<url>");
-    return;
+  const targetUrl = parseTargetFromReq(req.url, "http://proxy.local");
+  if (!targetUrl) return res.status(400).send("Missing or invalid ?url=");
+
+  if (!allowedHost(targetUrl.hostname)) {
+    return res.status(403).send("Target host not allowed.");
   }
 
-  let targetUrl;
-  try {
-    targetUrl = new URL(targetStr);
-  } catch {
-    res.status(400).send("Invalid target URL");
-    return;
-  }
+  // Remember last target origin for convenience
+  res.cookie("last_target", targetUrl.origin, {
+    httpOnly: false,
+    sameSite: "Lax",
+    maxAge: 1000 * 60 * 60 * 24 * 14
+  });
 
-  // Remember last target in a cookie for UX
-  try {
-    res.cookie("last_target", targetUrl.origin, {
-      httpOnly: false,
-      sameSite: "Lax",
-      maxAge: 1000 * 60 * 60 * 24 * 14 // 14 days
-    });
-  } catch {}
+  // Stash context for hooks
+  req._targetOrigin = targetUrl.origin;
+  req._proto = (req.headers["x-forwarded-proto"] || "").split(",")[0] || req.protocol || "https";
 
-  // http-proxy wants an origin in 'target' and the path in req.url.
-  // We temporarily rewrite req.url to the upstream path + search.
-  const upstreamPath = targetUrl.pathname + targetUrl.search + targetUrl.hash;
+  // Rewrite req.url to upstream path so http-proxy forwards correctly
+  req.url = targetUrl.pathname + targetUrl.search + targetUrl.hash;
 
-  // Save original to restore later (not strictly required)
-  const originalUrl = req.url;
-
-  // Strip our /proxy?target=... and replace with the real upstream path
-  req.url = upstreamPath;
-
-  // Forward it
-  proxy.web(req, res, { target: targetUrl.origin });
-  
-  // No need to restore req.url after; request lifecycle ends here.
+  proxy.web(req, res, {
+    target: targetUrl.origin,
+    autoRewrite: true
+  });
 });
 
-// WebSocket upgrades: same /proxy?target=wss://... pattern
+// ---- WebSocket Proxy upgrade ----
+// Same pattern: /proxy?url=wss://gateway.discord.gg/?v=10&encoding=json
 const server = http.createServer(app);
 server.on("upgrade", (req, socket, head) => {
-  try {
-    const reqUrl = new URL(req.url, "http://placeholder");
-    const targetStr = reqUrl.searchParams.get("target");
-    if (!targetStr) {
-      socket.destroy();
-      return;
-    }
-    const targetUrl = new URL(targetStr);
+  const targetUrl = parseTargetFromReq(req.url, "http://proxy.local");
+  if (!targetUrl) return socket.destroy();
 
-    // For WS, http-proxy reads the path from req.url too:
-    // set req.url to upstream path before handing off.
-    req.url = targetUrl.pathname + targetUrl.search + targetUrl.hash;
+  if (!allowedHost(targetUrl.hostname)) return socket.destroy();
 
-    proxy.ws(req, socket, head, { target: targetUrl.origin });
-  } catch (e) {
-    console.error("WS upgrade error:", e?.message || e);
-    socket.destroy();
-  }
+  req._targetOrigin = targetUrl.origin;
+  // For WS, ensure path sent upstream is only the target path/search/hash
+  req.url = targetUrl.pathname + targetUrl.search + targetUrl.hash;
+
+  proxy.ws(req, socket, head, {
+    target: targetUrl.origin
+  });
 });
 
-// A convenience redirect: visiting /go?u=<url> sets a cookie history and jumps to /proxy?target=<url>
+// Convenience: simple redirector that also maintains a small "recents" cookie
 app.get("/go", (req, res) => {
   const u = req.query.u;
   if (!u) return res.redirect("/");
-  // Append to simple cookie-based history (comma-separated)
-  const current = (req.cookies.recent_targets || "").split(",").filter(Boolean);
-  if (!current.includes(u)) current.unshift(u);
-  const trimmed = current.slice(0, 8); // keep last 8
-  res.cookie("recent_targets", trimmed.join(","), { httpOnly: false, sameSite: "Lax", maxAge: 1000 * 60 * 60 * 24 * 30 });
-  res.redirect(`/proxy?target=${encodeURIComponent(u)}`);
+  try {
+    const abs = new URL(u);
+    const current = (req.cookies.recent_targets || "").split(",").filter(Boolean);
+    if (!current.includes(abs.toString())) current.unshift(abs.toString());
+    res.cookie("recent_targets", current.slice(0, 8).join(","), {
+      httpOnly: false,
+      sameSite: "Lax",
+      maxAge: 1000 * 60 * 60 * 24 * 30
+    });
+    res.redirect(`/proxy?url=${encodeURIComponent(abs.toString())}`);
+  } catch {
+    res.redirect("/");
+  }
 });
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => {
-  console.log("✅ Proxy listening on", PORT);
+  console.log(`✅ Proxy listening on ${PORT}`);
 });

@@ -1,7 +1,7 @@
 {
   "name": "universal-ws-proxy",
   "version": "1.0.0",
-  "description": "Universal HTTP + WebSocket proxy with redirect rewriting and cookie-saved recent targets.",
+  "description": "Universal HTTP+WS proxy with redirect/cookie rewriting and a minimal frontend.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
@@ -12,6 +12,7 @@
   "dependencies": {
     "cookie-parser": "1.4.6",
     "express": "4.18.2",
-    "http-proxy": "1.18.1"
+    "http-proxy": "1.18.1",
+    "morgan": "1.10.0"
   }
 }
