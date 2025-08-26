@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Universal WS Proxy</title>
+  <style>
+    body { font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; margin: 24px; }
+    .box { max-width: 720px; margin: 0 auto; padding: 20px; border: 1px solid #ddd; border-radius: 14px; }
+    input[type=url] { width: 100%; padding: 12px; font-size: 16px; border: 1px solid #ccc; border-radius: 10px; }
+    button { margin-top: 12px; padding: 10px 14px; font-size: 15px; border-radius: 10px; border: 0; cursor: pointer; }
+    .primary { background: #1f6feb; color: white; }
+    .chips { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 12px; }
+    .chip { padding: 8px 10px; background: #f3f4f6; border-radius: 999px; cursor: pointer; }
+    small { color: #666; }
+  </style>
+</head>
+<body>
+  <div class="box">
+    <h1>Universal HTTP + WS Proxy</h1>
+    <p>Enter a full URL (e.g., <code>https://discord.com</code> or <code>https://web.whatsapp.com</code>)</p>
+    <form id="f">
+      <input id="u" type="url" placeholder="https://discord.com" required />
+      <button class="primary" type="submit">Open via Proxy</button>
+    </form>
+    <div id="recent"></div>
+    <p><small>Recent targets are saved in cookies on this browser.</small></p>
+  </div>
+
+  <script>
+    function getCookie(name) {
+      const m = document.cookie.match(new RegExp('(?:^|; )' + name.replace(/([$?*|{}\(\)\[\]\\\/\+^])/g, '\\$1') + '=([^;]*)'));
+      return m ? decodeURIComponent(m[1]) : '';
+    }
+    function setCookie(name, value, days=30) {
+      const d = new Date();
+      d.setTime(d.getTime() + days*24*60*60*1000);
+      document.cookie = `${name}=${encodeURIComponent(value)}; expires=${d.toUTCString()}; path=/; samesite=lax`;
+    }
+
+    const form = document.getElementById("f");
+    const input = document.getElementById("u");
+    const recentDiv = document.getElementById("recent");
+
+    function renderRecent() {
+      const raw = getCookie("recent_targets");
+      const list = raw ? raw.split(",").filter(Boolean) : [];
+      if (!list.length) { recentDiv.innerHTML = ""; return; }
+      recentDiv.innerHTML = '<div class="chips">' + list.map(u => `<span class="chip" data-u="${u}">${u}</span>`).join("") + '</div>';
+      recentDiv.querySelectorAll(".chip").forEach(el => {
+        el.addEventListener("click", () => {
+          window.location.href = `/go?u=${encodeURIComponent(el.dataset.u)}`;
+        });
+      });
+    }
+
+    form.addEventListener("submit", (e) => {
+      e.preventDefault();
+      const val = input.value.trim();
+      try {
+        const u = new URL(val);
+        // prepend into cookie history
+        const existing = (getCookie("recent_targets") || "").split(",").filter(Boolean);
+        if (!existing.includes(u.toString())) existing.unshift(u.toString());
+        setCookie("recent_targets", existing.slice(0, 8).join(","));
+        window.location.href = `/proxy?target=${encodeURIComponent(u.toString())}`;
+      } catch {
+        alert("Please enter a valid absolute URL (e.g., https://discord.com).");
+      }
+    });
+
+    // Prefill with last target if present
+    const last = getCookie("last_target");
+    if (last) input.value = last;
+
+    renderRecent();
+  </script>
+</body>
+</html>
